@@ -39,39 +39,43 @@ class GPTBaseConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
-    # If True, accumulate block outputs as a running mean instead of a sum:
-    # x_i = mean(block_1_out, ..., block_(i+1)_out), via x = (i * x + new_x) / (i+1).
-    # Keeps residual magnitude bounded without pinning it (rmsnorm would force ||x||=sqrt(d)).
-    normalize_residual: bool = False
     # If True, blend the initial normalized embedding x0 back into the residual at the
     # last 1/3 of blocks: x = 0.5 * x + 0.5 * x0 (applied before each late block).
     add_init_res: bool = False
-    # If True, blend x0 into the MLP input ONLY at the last 1/3 of blocks:
-    # mlp_in = 0.5 * norm(x) + 0.5 * norm(x0) (each branch normed separately so the two
-    # contributions have matched magnitudes regardless of how much the residual has grown).
-    # The residual stream and attention input are untouched. Isolates the MLP-path
-    # contribution of the x0 skip.
-    add_init_res_mlp: bool = False
+    # At the last 1/3 of blocks, mlp_in = norm(0.5 * x + 0.5 * x0) (average first, then a
+    # single norm). The residual stream and attention input are untouched. Isolates the
+    # MLP-path contribution of the x0 skip.
+    add_init_res_mlp_pre_norm: bool = False
     # If True, capture v from layer 0's attention (after c_v projection) and mix it into
     # the last 1/3 of layers' v: v_i = 0.5 * v_i + 0.5 * v_layer0. Lightweight analogue
-    # of gpt.py's value-residual without per-layer learned VE tables.
-    add_init_value: bool = False
-    # Sub-mode of add_init_value: if True, each late layer applies its OWN c_v to norm(x0)
-    # to produce ve, instead of reusing layer 0's v. Disentangles "Wv_layer0 is special"
-    # from "x0 input is special".
-    init_value_self_wv: bool = False
-    # If True, detach the gradient path back to the embedding through the ve route.
-    # In self_wv mode this detaches x0_norm BEFORE c_v, so each layer's c_v still gets
-    # gradient from the share path (only the input gradient is killed). In shared mode
-    # the whole captured ve is detached (which also kills layer 0's c_v gradient — less
-    # clean, only meaningful in self_wv mode). Used to isolate "is the win the backward
-    # gradient skip-connection to the embedding?" from the forward semantic leakage.
+    # of gpt.py's value-residual without per-layer learned VE tables. Shared-mode only:
+    # for the per-layer-c_v variant, see add_init_res_v.
+    add_init_v: bool = False
+    # If True, at the last 1/3 of layers, blend v with this SAME layer's projection of
+    # norm(x0) through c_v: v = 0.5*v + 0.5*c_v(norm(x0)). Disentangles "Wv_layer0 is
+    # special" from "x0 input is special" relative to add_init_v. Mutually exclusive
+    # with add_init_v and add_init_qkv (all three write to v).
+    add_init_res_v: bool = False
+    # If True, detach x0 before the block loop so every x0-using path (add_init_res,
+    # add_init_res_mlp_pre_norm, add_init_qkv, add_init_res_v) consumes a detached x0.
+    # Forward values are unchanged; only the gradient skip-connection back to the
+    # embedding through these paths is killed. Used to isolate "is the win the backward
+    # gradient skip to the embedding?" from forward semantic leakage. No effect on
+    # add_init_v, which routes through layer-0's v rather than x0.
     detach_init_value: bool = False
     # If True, at the last 1/3 of layers, blend q, k, v with projections of x0 through
     # this SAME layer's c_q, c_k, c_v: q = 0.5*q + 0.5*c_q(norm(x0)), and same for k, v.
     # Apples-to-apples to add_init_res for "what does the qkv skip buy?" without touching
-    # the residual stream that the MLP reads. Mutually exclusive with add_init_value.
+    # the residual stream that the MLP reads. Mutually exclusive with add_init_v and
+    # add_init_res_v.
     add_init_qkv: bool = False
+    # If True, replace the hardcoded 0.5/0.5 blends in add_init_res / add_init_v /
+    # add_init_res_v / add_init_qkv with per-late-layer learnable scalars (alpha, beta),
+    # init to (1.0, 0.0). At step 0 the model is identical to a no-skip vanilla baseline;
+    # the optimizer learns how much x0 (or layer-0 v) contribution each late layer wants.
+    # alpha multiplies the "main" branch, beta multiplies the x0/ve "skip" branch.
+    # No effect on add_init_res_mlp_pre_norm (its norm-of-sum form is left fixed).
+    learn_init_coeffs: bool = False
 
 
 def norm(x):
@@ -94,9 +98,12 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, window_size):
         super().__init__()
+        self.config = config
         self.layer_idx = layer_idx
+        self.is_late = layer_idx >= (2 * config.n_layer) // 3
+        self.window_size = window_size
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
@@ -107,26 +114,68 @@ class CausalSelfAttention(nn.Module):
         self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+        # Learnable blend coeffs (init 1.0/0.0 in init_weights) for late-layer x0 skips,
+        # gated on cfg.learn_init_coeffs and which v-writing flag is active.
+        v_writer = config.add_init_v or config.add_init_res_v or config.add_init_qkv
+        if self.is_late and config.learn_init_coeffs and v_writer:
+            self.alpha_v = nn.Parameter(torch.empty(1))
+            self.beta_v = nn.Parameter(torch.empty(1))
+        if self.is_late and config.learn_init_coeffs and config.add_init_qkv:
+            self.alpha_q = nn.Parameter(torch.empty(1))
+            self.beta_q = nn.Parameter(torch.empty(1))
+            self.alpha_k = nn.Parameter(torch.empty(1))
+            self.beta_k = nn.Parameter(torch.empty(1))
 
-    def forward(self, x, ve, x0_norm, cos_sin, window_size, kv_cache):
+    def forward(self, x, x0, ve, cos_sin, kv_cache):
         B, T, C = x.size()
+        cfg = self.config
 
         # Project the input to get queries, keys, and values
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-        v_init = v  # captured for add_init_value sharing (always returned, ignored if unused)
+        v_init = v  # captured for shared-mode add_init_v (always returned, ignored if unused)
 
-        # add_init_qkv: blend each of q, k, v with this layer's projection of norm(x0)
-        if x0_norm is not None:
-            q = 0.5 * q + 0.5 * self.c_q(x0_norm).view(B, T, self.n_head, self.head_dim)
-            k = 0.5 * k + 0.5 * self.c_k(x0_norm).view(B, T, self.n_kv_head, self.head_dim)
-            v = 0.5 * v + 0.5 * self.c_v(x0_norm).view(B, T, self.n_kv_head, self.head_dim)
+        # Compute normalized x0 once if any late-layer x0->qkv path needs it.
+        # x0 is already detached at GPTBase.forward entry if cfg.detach_init_value.
+        need_x0n = self.is_late and (cfg.add_init_qkv or cfg.add_init_res_v)
+        x0n = norm(x0) if need_x0n else None
 
-        # add_init_value: blend in layer-0's v projection (passed via ve)
-        if ve is not None:
-            v = 0.5 * v + 0.5 * ve
+        # add_init_qkv: blend each of q, k, v with this layer's projection of norm(x0).
+        if self.is_late and cfg.add_init_qkv:
+            cqx = self.c_q(x0n).view(B, T, self.n_head, self.head_dim)
+            ckx = self.c_k(x0n).view(B, T, self.n_kv_head, self.head_dim)
+            cvx = self.c_v(x0n).view(B, T, self.n_kv_head, self.head_dim)
+            if cfg.learn_init_coeffs:
+                # Cast scalar params to activation dtype to keep q/k/v in bf16 for FA3.
+                aq, bq = self.alpha_q.to(q.dtype), self.beta_q.to(q.dtype)
+                ak, bk = self.alpha_k.to(k.dtype), self.beta_k.to(k.dtype)
+                av, bv = self.alpha_v.to(v.dtype), self.beta_v.to(v.dtype)
+                q = aq * q + bq * cqx
+                k = ak * k + bk * ckx
+                v = av * v + bv * cvx
+            else:
+                q = 0.5 * q + 0.5 * cqx
+                k = 0.5 * k + 0.5 * ckx
+                v = 0.5 * v + 0.5 * cvx
+
+        # add_init_v: blend layer-0's captured v into v (shared mode).
+        elif self.is_late and cfg.add_init_v:
+            if cfg.learn_init_coeffs:
+                av, bv = self.alpha_v.to(v.dtype), self.beta_v.to(v.dtype)
+                v = av * v + bv * ve
+            else:
+                v = 0.5 * v + 0.5 * ve
+
+        # add_init_res_v: blend this layer's own c_v(norm(x0)) (self-wv mode).
+        elif self.is_late and cfg.add_init_res_v:
+            cvx = self.c_v(x0n).view(B, T, self.n_kv_head, self.head_dim)
+            if cfg.learn_init_coeffs:
+                av, bv = self.alpha_v.to(v.dtype), self.beta_v.to(v.dtype)
+                v = av * v + bv * cvx
+            else:
+                v = 0.5 * v + 0.5 * cvx
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
@@ -139,7 +188,7 @@ class CausalSelfAttention(nn.Module):
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=self.window_size)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -148,7 +197,7 @@ class CausalSelfAttention(nn.Module):
                 k=k, v=v,
                 cache_seqlens=kv_cache.cache_seqlens,
                 causal=True,
-                window_size=window_size,
+                window_size=self.window_size,
             )
             # Advance position after last layer processes
             if self.layer_idx == kv_cache.n_layers - 1:
@@ -174,15 +223,34 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, window_size):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.config = config
+        self.layer_idx = layer_idx
+        self.is_late = layer_idx >= (2 * config.n_layer) // 3
+        self.attn = CausalSelfAttention(config, layer_idx, window_size)
         self.mlp = MLP(config)
+        # Learnable blend coeffs (init 1.0/0.0 in init_weights) for add_init_res.
+        if self.is_late and config.learn_init_coeffs and config.add_init_res:
+            self.alpha_res = nn.Parameter(torch.empty(1))
+            self.beta_res = nn.Parameter(torch.empty(1))
 
-    def forward(self, x, ve, x0_norm, cos_sin, window_size, kv_cache, x0_mlp=None):
-        attn_out, v_init = self.attn(norm(x), ve, x0_norm, cos_sin, window_size, kv_cache)
+    def forward(self, x, x0, ve, cos_sin, kv_cache):
+        cfg = self.config
+        if self.is_late and cfg.add_init_res:
+            if cfg.learn_init_coeffs:
+                # Cast scalar params to activation dtype: master weights stay fp32 for
+                # optimizer precision, but the multiply must run in bf16 to keep FA3 happy.
+                a, b = self.alpha_res.to(x.dtype), self.beta_res.to(x.dtype)
+                x = a * x + b * x0
+            else:
+                x = 0.5 * x + 0.5 * x0
+        attn_out, v_init = self.attn(norm(x), x0, ve, cos_sin, kv_cache)
         x = x + attn_out
-        mlp_in = norm(x) if x0_mlp is None else 0.5 * norm(x0_mlp) + 0.5 * norm(x)
+        if self.is_late and cfg.add_init_res_mlp_pre_norm:
+            mlp_in = norm(0.5 * x + 0.5 * x0)
+        else:
+            mlp_in = norm(x)
         x = x + self.mlp(mlp_in)
         return x, v_init
 
@@ -196,10 +264,17 @@ class GPTBase(nn.Module):
         """
         super().__init__()
         self.config = config
-        assert not (config.detach_init_value and not config.init_value_self_wv), \
-            "detach_init_value only has clean semantics with init_value_self_wv=True"
-        assert not (config.add_init_qkv and config.add_init_value), \
-            "add_init_qkv and add_init_value are mutually exclusive ablations"
+        x0_users = [config.add_init_res, config.add_init_res_mlp_pre_norm,
+                    config.add_init_qkv, config.add_init_res_v]
+        assert not (config.detach_init_value and not any(x0_users)), \
+            "detach_init_value requires at least one x0-using flag enabled"
+        v_writers = [config.add_init_qkv, config.add_init_v, config.add_init_res_v]
+        assert sum(v_writers) <= 1, \
+            "add_init_qkv, add_init_v, add_init_res_v all write to v — at most one"
+        coeff_users = [config.add_init_res, config.add_init_v,
+                       config.add_init_res_v, config.add_init_qkv]
+        assert not (config.learn_init_coeffs and not any(coeff_users)), \
+            "learn_init_coeffs requires at least one of add_init_res/v/res_v/qkv"
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
@@ -210,7 +285,10 @@ class GPTBase(nn.Module):
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList([
+                Block(config, layer_idx, self.window_sizes[layer_idx])
+                for layer_idx in range(config.n_layer)
+            ]),
         })
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         # Smear: mix previous token's embedding into current token (cheap bigram-like info)
@@ -256,6 +334,16 @@ class GPTBase(nn.Module):
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            # Learnable blend coeffs: alpha (main) -> 1.0, beta (skip) -> 0.0.
+            # At step 0, the model is identical to a no-skip vanilla baseline.
+            if hasattr(block, 'alpha_res'):
+                block.alpha_res.fill_(1.0); block.beta_res.fill_(0.0)
+            attn = block.attn
+            if hasattr(attn, 'alpha_v'):
+                attn.alpha_v.fill_(1.0); attn.beta_v.fill_(0.0)
+            if hasattr(attn, 'alpha_q'):
+                attn.alpha_q.fill_(1.0); attn.beta_q.fill_(0.0)
+                attn.alpha_k.fill_(1.0); attn.beta_k.fill_(0.0)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -330,9 +418,16 @@ class GPTBase(nn.Module):
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
         """
         nparams = sum(p.numel() for p in self.parameters())
-        # Exclude non-matmul params: embeddings and smear scalars
+        # Exclude non-matmul params: embeddings, smear scalars, learnable blend coeffs
+        coeff_numel = sum(
+            getattr(m, n).numel()
+            for m in [b for b in self.transformer.h] + [b.attn for b in self.transformer.h]
+            for n in ('alpha_res', 'beta_res', 'alpha_q', 'beta_q', 'alpha_k', 'beta_k', 'alpha_v', 'beta_v')
+            if hasattr(m, n)
+        )
         nparams_exclude = (self.transformer.wte.weight.numel() +
-                          self.smear_gate.weight.numel() + self.smear_lambda.numel())
+                          self.smear_gate.weight.numel() + self.smear_lambda.numel() +
+                          coeff_numel)
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -374,12 +469,28 @@ class GPTBase(nn.Module):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
+        # Collect learnable blend coeffs (alpha = main path, beta = skip path) into
+        # named lists so they can go into the right AdamW groups (mirrors gpt.py's
+        # resid_lambdas/x0_lambdas treatment).
+        alpha_params, beta_params = [], []
+        for block in self.transformer.h:
+            for n in ('alpha_res',):
+                if hasattr(block, n): alpha_params.append(getattr(block, n))
+            for n in ('beta_res',):
+                if hasattr(block, n): beta_params.append(getattr(block, n))
+            for n in ('alpha_q', 'alpha_k', 'alpha_v'):
+                if hasattr(block.attn, n): alpha_params.append(getattr(block.attn, n))
+            for n in ('beta_q', 'beta_k', 'beta_v'):
+                if hasattr(block.attn, n): beta_params.append(getattr(block.attn, n))
+        coeff_params = alpha_params + beta_params
+
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        all_block_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in all_block_params if p.dim() >= 2]  # exclude scalar coeffs
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         smear_params = [self.smear_gate.weight, self.smear_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(smear_params) + len(coeff_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -392,6 +503,13 @@ class GPTBase(nn.Module):
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        # Learnable blend coeffs (only present when learn_init_coeffs is set).
+        # alpha (main, init 1.0): low LR + weight decay, like gpt.py's resid_lambdas.
+        # beta  (skip, init 0.0): high LR no decay,        like gpt.py's x0_lambdas.
+        if alpha_params:
+            param_groups.append(dict(kind='adamw', params=alpha_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05))
+        if beta_params:
+            param_groups.append(dict(kind='adamw', params=beta_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -441,49 +559,19 @@ class GPTBase(nn.Module):
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * x_pre_smear
 
-        # Forward the trunk of the Transformer
-        x0 = x  # initial normalized embedding (post-smear), used for add_init_res
-        normalize_residual = self.config.normalize_residual
-        add_init_res = self.config.add_init_res
-        add_init_value = self.config.add_init_value
-        init_value_self_wv = self.config.init_value_self_wv
-        detach_init_value = self.config.detach_init_value
-        add_init_qkv = self.config.add_init_qkv
-        add_init_res_mlp = self.config.add_init_res_mlp
-        late_layer_start = (2 * self.config.n_layer) // 3  # add_init_* only fire from here on
-        # Pre-compute norm(x0) for paths that need it: add_init_value's self_wv mode (each
-        # late layer applies its own c_v to it) and add_init_qkv (each late layer applies
-        # its own c_q/c_k/c_v to it).
-        # When detach_init_value is set, we detach x0_norm here so the matmul W @ x0_norm.detach()
-        # still gives gradient to W (each layer's c_v) but stops gradient back to the embedding.
-        x0_norm = norm(x0) if ((add_init_value and init_value_self_wv) or add_init_qkv) else None
-        if x0_norm is not None and detach_init_value:
-            x0_norm = x0_norm.detach()
-        n_kv_head = self.config.n_kv_head
-        head_dim = self.config.n_embd // self.config.n_head
-        ve = None  # filled by layer 0's v projection if add_init_value (shared mode)
+        # Forward the trunk of the Transformer.
+        # x0 = post-smear residual; used by all add_init_* paths inside Block/Attention.
+        # detach_init_value: detach once here (idempotent — same as detaching per-block).
+        # x is passed un-detached, so add_init_v's layer-0 v capture is unaffected.
+        # ve = layer-0 v capture, only consumed by add_init_v (shared-mode value residual).
+        x0 = x
+        if self.config.detach_init_value:
+            x0 = x0.detach()
+        ve = None
         for i, block in enumerate(self.transformer.h):
-            in_last_third = i >= late_layer_start
-            if add_init_res and in_last_third:
-                x = 0.5 * x + 0.5 * x0
-            if add_init_value and in_last_third:
-                if init_value_self_wv:
-                    block_ve = block.attn.c_v(x0_norm).view(B, T, n_kv_head, head_dim)
-                else:
-                    block_ve = ve
-            else:
-                block_ve = None
-            block_x0_norm = x0_norm if (add_init_qkv and in_last_third) else None
-            block_x0_mlp = x0 if (add_init_res_mlp and in_last_third) else None
-            new_x, v_init = block(x, block_ve, block_x0_norm, cos_sin, self.window_sizes[i], kv_cache, x0_mlp=block_x0_mlp)
-            if add_init_value and not init_value_self_wv and i == 0:
+            x, v_init = block(x, x0, ve, cos_sin, kv_cache)
+            if self.config.add_init_v and i == 0:
                 ve = v_init
-            if normalize_residual:
-                # Running mean: x_i = mean(block_1_out, ..., block_(i+1)_out).
-                # Equivalent to x = ((i)/(i+1)) * x + (1/(i+1)) * new_x.
-                x = (i * x + new_x) / (i + 1)
-            else:
-                x = new_x
         x = norm(x)
 
         # Forward the lm_head (compute logits)

@@ -28,35 +28,62 @@ class GPTNoLambdaConfig(GPTConfig):
 from nanochat.model.gpt_base import GPTBaseConfig, GPTBase
 
 @dataclass
-class GPTBaseNormResConfig(GPTBaseConfig):
-    normalize_residual: bool = True
-
-@dataclass
 class GPTBaseAddInitResConfig(GPTBaseConfig):
     add_init_res: bool = True
 
 @dataclass
-class GPTBaseAddInitResMlpConfig(GPTBaseConfig):
-    add_init_res_mlp: bool = True
+class GPTBaseAddInitResDetachConfig(GPTBaseConfig):
+    add_init_res: bool = True
+    detach_init_value: bool = True
 
 @dataclass
-class GPTBaseAddInitValueConfig(GPTBaseConfig):
-    add_init_value: bool = True
+class GPTBaseAddInitResMlpPreNormConfig(GPTBaseConfig):
+    add_init_res_mlp_pre_norm: bool = True
 
 @dataclass
-class GPTBaseAddInitValueSelfWvConfig(GPTBaseConfig):
-    add_init_value: bool = True
-    init_value_self_wv: bool = True
+class GPTBaseAddInitResMlpPreNormDetachConfig(GPTBaseConfig):
+    add_init_res_mlp_pre_norm: bool = True
+    detach_init_value: bool = True
 
 @dataclass
-class GPTBaseAddInitValueSelfWvDetachConfig(GPTBaseConfig):
-    add_init_value: bool = True
-    init_value_self_wv: bool = True
+class GPTBaseAddInitVConfig(GPTBaseConfig):
+    add_init_v: bool = True
+
+@dataclass
+class GPTBaseAddInitResVConfig(GPTBaseConfig):
+    add_init_res_v: bool = True
+
+@dataclass
+class GPTBaseAddInitResVDetachConfig(GPTBaseConfig):
+    add_init_res_v: bool = True
     detach_init_value: bool = True
 
 @dataclass
 class GPTBaseAddInitQkvConfig(GPTBaseConfig):
     add_init_qkv: bool = True
+
+# Learnable-coefficient variants: (alpha, beta) per late layer init to (1.0, 0.0).
+# At step 0 the model is identical to vanilla; the optimizer learns how much x0 /
+# layer-0 v contribution each late layer wants.
+@dataclass
+class GPTBaseAddInitResLearnConfig(GPTBaseConfig):
+    add_init_res: bool = True
+    learn_init_coeffs: bool = True
+
+@dataclass
+class GPTBaseAddInitVLearnConfig(GPTBaseConfig):
+    add_init_v: bool = True
+    learn_init_coeffs: bool = True
+
+@dataclass
+class GPTBaseAddInitResVLearnConfig(GPTBaseConfig):
+    add_init_res_v: bool = True
+    learn_init_coeffs: bool = True
+
+@dataclass
+class GPTBaseAddInitQkvLearnConfig(GPTBaseConfig):
+    add_init_qkv: bool = True
+    learn_init_coeffs: bool = True
 
 # -----------------------------------------------------------------------------
 # Standalone variants (each has its own model class in its own file)
@@ -73,13 +100,19 @@ MODELS = {
     "gpt_nolambda":     (GPTNoLambdaConfig,     GPT),
     # gpt_base.py family
     "gpt_base":                (GPTBaseConfig,             GPTBase),
-    "gpt_base_normres":        (GPTBaseNormResConfig,      GPTBase),
-    "gpt_base_add_init_res":   (GPTBaseAddInitResConfig,   GPTBase),
-    "gpt_base_add_init_res_mlp": (GPTBaseAddInitResMlpConfig, GPTBase),
-    "gpt_base_add_init_value":         (GPTBaseAddInitValueConfig,       GPTBase),
-    "gpt_base_add_init_value_self_wv":        (GPTBaseAddInitValueSelfWvConfig,       GPTBase),
-    "gpt_base_add_init_value_self_wv_detach": (GPTBaseAddInitValueSelfWvDetachConfig, GPTBase),
-    "gpt_base_add_init_qkv":                  (GPTBaseAddInitQkvConfig,               GPTBase),
+    "gpt_base_add_init_res":         (GPTBaseAddInitResConfig,         GPTBase),
+    "gpt_base_add_init_res_detach":  (GPTBaseAddInitResDetachConfig,   GPTBase),
+    "gpt_base_add_init_res_mlp_pre_norm": (GPTBaseAddInitResMlpPreNormConfig, GPTBase),
+    "gpt_base_add_init_res_mlp_pre_norm_detach": (GPTBaseAddInitResMlpPreNormDetachConfig, GPTBase),
+    "gpt_base_add_init_v":            (GPTBaseAddInitVConfig,           GPTBase),
+    "gpt_base_add_init_res_v":        (GPTBaseAddInitResVConfig,        GPTBase),
+    "gpt_base_add_init_res_v_detach": (GPTBaseAddInitResVDetachConfig,  GPTBase),
+    "gpt_base_add_init_qkv":          (GPTBaseAddInitQkvConfig,         GPTBase),
+    # learnable-coefficient variants
+    "gpt_base_add_init_res_learn":    (GPTBaseAddInitResLearnConfig,    GPTBase),
+    "gpt_base_add_init_v_learn":      (GPTBaseAddInitVLearnConfig,      GPTBase),
+    "gpt_base_add_init_res_v_learn":  (GPTBaseAddInitResVLearnConfig,   GPTBase),
+    "gpt_base_add_init_qkv_learn":    (GPTBaseAddInitQkvLearnConfig,    GPTBase),
     # standalone variants
     "attn_res":      (GPTAttnResConfig,     GPTAttnRes),
     "attn_res_sink": (GPTAttnResSinkConfig, GPTAttnResSink),
